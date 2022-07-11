@@ -1,0 +1,267 @@
+image:
+  # name: registry.gitlab.com/gitlab-org/gitlab-build-images:terraform
+  name: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    - 'AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}' 
+    - 'AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}' 
+    - 'AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}'
+
+cache:
+  key: ${TF_STATE}
+  paths:
+    - ${TF_ROOT}/.terraform
+    - ~/.aws
+
+.install_scripts: &install_scripts
+  - >
+    install_deps() {
+      install_command=''
+      is_command apk && install_command() { apk add --no-cache --update "$@"; }
+      is_command yum && install_command() { yum install -y "$@"; }
+      is_command apt-get && install_command() { apt-get update -y && apt-get install -y "$@"; }
+      deps="$@"
+      for dep in ${deps}; do
+        is_command "${dep}" || install_command "${dep}"
+      done
+    }
+#TODO find way not to loop over package manager
+.aws_config: &aws_config
+  - |-
+    pecho "Running in" "$CI_ENVIRONMENT_NAME environment"
+    if [ "$CI_ENVIRONMENT_NAME" == "prod" ]; then
+      AWS_PROFILE="prod-cloud"
+    elif [ "$CI_ENVIRONMENT_NAME" == "uat" ]; then
+      AWS_PROFILE="gov-cloud"
+    elif [ "$CI_ENVIRONMENT_NAME" == "play" ]; then
+      AWS_PROFILE="play-cloud"
+    else
+      AWS_PROFILE="dev-cloud"
+    fi
+    pecho "Running in" "$AWS_PROFILE profile"
+  - mkdir -p ~/.aws
+  - |
+    cat > ~/.aws/credentials << EOL
+    [default]
+    aws_access_key_id=${AWS_ACCESS_KEY_ID}
+    aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}
+    [$AWS_PROFILE]
+    aws_access_key_id=${AWS_ACCESS_KEY_ID}
+    aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}
+    EOL
+.ssh_config: &ssh_config
+  # TODO make this a function
+  - eval $(ssh-agent -s)
+  - cat "$ADMIN_USER_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - git config --global user.email "devops@benchmarkanalytics.com"
+  - git config --global user.name "devops-gitlab-admin"
+  - ssh-keyscan gitlab.dev-benchmarkanalytics.com >> ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+    # Prove everything is working
+  - ssh -T git@gitlab.dev-benchmarkanalytics.com
+  # - echo -e "credentials \"$CI_SERVER_HOST\" {\n  token = \"$CI_JOB_TOKEN\"\n}" > $CI_PROJECT_DIR/.terraformrc
+  - |-
+    cat <<EOF > ~/.terraformrc
+    credentials "gitlab.com" {
+      token = "${CI_JOB_TOKEN}"
+    }
+    EOF
+
+.gitlab_funcs: &gitlab_funcs
+  - >
+    function glab_projects_search {
+      query=$1
+      sort=${2:-asc}
+      res=''
+      for i in $(seq 1 $total_pages); do
+        this_res=$(curl -s --header "$HEADER" "$BASE_URL/projects?search=$query&page=$i&sort=$sort" | jq -r '.[]')
+        res="${res}${this_res}"
+      done
+      echo "$res" | jq -s
+    }
+  - >
+    function gitlab_create_variable {
+      help_msg() {
+        pecho "Usage gitlab_create_variable" "<project_id> <key> <value> <env> <sensitive-true>"
+      }
+      project_id="$1"
+      [[ -z "$project_id" ]] && help_msg && return 1
+      var_key="$2"
+      [[ -z "$var_key" ]] && help_msg && return 1
+      var_value="$3"
+      [[ -z "$var_value" ]] && help_msg && return 1
+      env="${4:-*}"
+      [[ -z "$env" ]] && help_msg && return 1
+      sensitive="${5:-true}"
+      data=$(jo -p key="$2" value="$3" variable_type="env_var" protected="false" masked="$sensitive" environment_scope="$env")
+      curl -s --header "$HEADER" -H 'Content-Type: application/json' -d "$data" "$BASE_URL/projects/$project_id/variables"
+    }
+  - >
+    function gitlab_set_variable {
+      help_msg() {
+        pecho "Usage gitlab_set_variable" "<project_id> <key> <value> <env> <sensitive-true>"
+      }
+      project_id="$1"
+      [[ -z "$project_id" ]] && help_msg && return 1
+      var_key="$2"
+      [[ -z "$var_key" ]] && help_msg && return 1
+      var_value="$3"
+      [[ -z "$var_value" ]] && help_msg && return 1
+      env="${4:-*}"
+      [[ -z "$env" ]] && help_msg && return 1
+      sensitive="${5:-true}"
+      data=$(jo -p key="$2" value="$3" variable_type="env_var" protected="false" masked="$sensitive" environment_scope="$env")
+      res=$(curl -s --request POST --header "$HEADER" -H 'Content-Type: application/json' -d "$data" "$BASE_URL/projects/$project_id/variables")
+      msg=$(echo $res | jq -r '.message')
+      if [[ "$msg" == "null" ]]; then
+        echo "Variable set for first time"
+      else
+        echo "Resetting var"
+        res=$(curl -s --request PUT --header "$HEADER" -H 'Content-Type: application/json' -d "$data" "$BASE_URL/projects/$project_id/variables/$var_key?filter[environment_scope]=$env")
+      fi
+      echo $res
+    }
+
+default:
+  before_script:
+    - *color_codes
+    - *util_scripts
+    - *install_scripts
+    # TODO move this conditional to the install_scripts section
+    - is_command apk && install_deps jq jo openssh-client git || install_deps jq jo openssh git
+    - *aws_config
+    - *ssh_config
+    - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+    - cd ${TF_ROOT}
+    - terraform --version
+    - pecho "initializing state in" "${TF_STATE}"
+    - terraform init -backend-config="access_key=${TF_STATE_BUCKET_ACCESS_KEY_ID_QA}" -backend-config="secret_key=${TF_STATE_BUCKET_SECRET_ACCESS_KEY_QA}" -backend-config="key=${TF_STATE}" -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="region=${TF_STATE_BUCKET_REGION}" 
+
+stages:
+  # - virus-scan
+  # leaving this stage out for now
+  # it needs to be more robust to the download failure
+  - build
+  - ad_hoc_command
+  - review
+  - deploy
+  - output
+  - destroy
+
+.build:
+  stage: build
+  inherit:
+    default: false
+  image: public.ecr.aws/docker/library/alpine:latest
+  before_script:
+    - *color_codes
+    - *util_scripts
+    - *install_scripts
+    # TODO move this conditional to the install_scripts section
+    - is_command apk && install_deps jq openssh-client git || install_deps jq jo openssh git
+    - *ssh_config
+    - *aws_config
+  script:
+    - echo "this won't do anything and is here to prevent errors from not having a script with before_script in case of disabled jobs"
+  rules:
+    - if: ($RUN_BUILD == "true")
+      when: always
+      allow_failure: true
+    - when: never
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/${DEFAULT_BUILD_DIR}
+    expire_in: 1 week
+    when: always
+
+.ad_hoc_command:
+  stage: ad_hoc_command
+  rules:
+    - if: ($AD_HOC_TERRAFORM_COMMAND)
+      when: manual
+      allow_failure: true
+    - when: never
+  script:
+    # - <<: *color_codes
+    - *color_codes
+    - pecho "Running ad-hoc terraform command" "${AD_HOC_TERRAFORM_COMMAND}"
+    - "${AD_HOC_TERRAFORM_COMMAND}"
+
+.plan:
+  stage: review
+  script:
+    - "${AD_HOC_DEBUG_COMMAND_REVIEW}"
+    - terraform validate
+    - terraform plan -out=${PLAN}
+    - terraform show --json ${PLAN} | jq -r '([.resource_changes[]?.change.actions?]|flatten)|{"create":(map(select(.=="create"))|length),"update":(map(select(.=="update"))|length),"delete":(map(select(.=="delete"))|length)}' > ${JSON_PLAN_FILE}
+    - terraform output -json | jq -r '.' > output.json
+    # - terraform show --json ${PLAN} | convert_report > ${JSON_PLAN_FILE}
+  artifacts:
+    paths:
+      - ${PROJECT_ACCOUNTS_ROOT}/${CI_ENVIRONMENT_NAME}
+    reports:
+      terraform: ${PROJECT_ACCOUNTS_ROOT}/${CI_ENVIRONMENT_NAME}/${JSON_PLAN_FILE}
+    expire_in: 1 week
+    when: always
+
+.apply:
+  stage: deploy
+  # environment:
+  #   name: ${TF_ENV}
+  script:
+    - "${AD_HOC_DEBUG_COMMAND_DEPLOY}"
+    - terraform apply --auto-approve ${PLAN}
+    - terraform output -json | jq -r '.' > output.json
+    # - gitlab-terraform apply
+    # using gitlab-terrafom causes 
+    # ╷
+    # │ Error: Failed to load "plan.cache" as a plan file
+    # │ 
+    # │ Error: stat plan.cache: no such file or directory
+    # with current config
+  artifacts:
+    paths:
+      - ${PROJECT_ACCOUNTS_ROOT}/${CI_ENVIRONMENT_NAME}/output.json
+    expire_in: 1 week
+    when: always
+  rules:
+    - if: ($DANGEROUSLY_DESTROY != "true")
+      when: manual
+      allow_failure: true
+    - when: never
+
+.destroy:
+  stage: destroy
+  script:
+    - terraform destroy --auto-approve
+  rules:
+    - if: ($DANGEROUSLY_DESTROY == "true")
+      when: manual
+      allow_failure: true
+    - when: never
+
+.output:
+  stage: output
+  before_script:
+    - *color_codes
+    - *gitlab_funcs
+    - cd ${PROJECT_ACCOUNTS_ROOT}/${CI_ENVIRONMENT_NAME}
+    - pecho "Displaying output for" "${PROJECT_ACCOUNTS_ROOT}/${CI_ENVIRONMENT_NAME}"
+    - cat output.json
+    - export TOKEN="${GITLAB_ACCESS_TOKEN}"
+    - export BASE_URL='https://gitlab.dev-benchmarkanalytics.com/api/v4'
+    - 'export HEADER="Authorization: Bearer ${TOKEN}"'
+    - echo "${HEADER}"
+    - echo "${TOKEN}"
+    - echo "${BASE_URL}"
+    - apk --no-cache add jo bash
+    - /bin/bash --version
+  script:
+    - echo "this won't do anything and is here to prevent errors from not having a script with before_script in case of disabled jobs"
+  rules:
+    - if: ($PARSE_OUTPUT == "true")
+      when: manual
+      allow_failure: true
+    - when: never
